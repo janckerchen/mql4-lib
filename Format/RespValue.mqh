@@ -27,7 +27,7 @@
 //+------------------------------------------------------------------+
 //| Convert long integer to an ASCII character array                 |
 //+------------------------------------------------------------------+
-int IntegerToCharArray(long value,char &buf[20])
+int IntegerToCharArray(long value,char &buf[])
   {
 //--- max length of long value is under 20 digits
    bool minus=false;
