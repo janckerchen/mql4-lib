@@ -30,6 +30,7 @@
 int IntegerToCharArray(long value,char &buf[])
   {
 //--- max length of long value is under 20 digits
+//--- this function will not resize buf, ensure it is large enough
    bool minus=false;
    if(value<0) {minus=true;value=-value;}
    int i=19;
