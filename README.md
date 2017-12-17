@@ -14,6 +14,7 @@ MQL Foundation Library For Professional Developers
   * [3.7 File System and IO](#file-system-and-io)
   * [3.8 Serialization Formats](#serialization-formats)
   * [3.9 Order Access](#order-access)
+  * [3.10 Symetric Order Semantics](#symetric-order-semantics)
 * [4. Contribution Guide](#contribution-guide)
 * [5. Changes](#changes)
 
@@ -160,7 +161,8 @@ When you create an indicator with this lib, it can be used as both standalone
 (controlled by the Terminal runtime) or driven by your programs. This is a
 powerful concept in that you can write your indicator once, and use it in your
 EA and Script, or as a standalone Indicator. You can use the indicator in normal
-time series chart, or let it driven by a RenkoIndicatorDriver.
+time series chart, or let it driven by a `HistoryData` derived class
+(TimeSeriesData, Renko, or TimeFrame).
 
 Let me show you with an example Indicator `DeMarker`. First we define the common
 reusable Indicator module in a header file `DeMarker.mqh`
@@ -314,33 +316,31 @@ DECLARE_INDICATOR(DeMarker,true);
 
 Or if you want to use it in your EA, driven by a Renko chart:
 ```MQL5
-//--- code snippets for using an indicator with IndicatorDriver
+//--- code snippets for using an indicator with Renko
 
 //--- OnInit
 //--- create the indicator manually, its runtime controlled flag is false by default
-   DeMarkerParam param;
+   DeMarkerParam *param=new DeMarkerParam;
    param.setAvgPeriod(14);
-   deMarker=new DeMarker(GetPointer(param));
+   deMarker=new DeMarker(param);
 
-//--- indicator driver is a container for indicators
-   IndicatorDriver *driver=new IndicatorDriver; 
+//--- HistoryData::OnUpdate is an event that can be subscribed by Indicators
+   renko = new Renko(_Symbol,300);
 //--- add indicator to the driver: you can add multiple indicators
-   driver.add(deMarker);
+//--- the OnUpdate event will delete its subscribers when destructed
+   renko.OnUpdate+=deMarker;
 //--- create the real driver that provide history data
-   renkoDriver = new RenkoIndicatorDriver(300,driver);
    
 //--- OnTick
-   renkoDriver.update(Close[0]);
+   renko.update(Close[0]);
    
-//--- after update, all indicators attached to the IndicatorDriver will be updated
+//--- after update, all indicators attached to the renko.OnUpdate event will be updated
 //--- access DeMarker
    double value = deMarker[0];
    
 //--- OnDeinit
 //--- need to release resources
-   delete deMarker;
-   delete driver;
-   delete renkoDriver;
+   delete renko;
 ```
 
 ### Event Handling
@@ -590,7 +590,7 @@ has their hash functions implemented in `Lang/Hash` module.
 The HashMap interface is very simple. Below is a simple example counting words
 of the famous opera `Hamlet`:
 
-```c++
+```MQL5
 #include <Mql/Lang/Script.mqh>
 #include <Mql/Collection/HashMap.mqh>
 #include <Mql/Utils/File.mqh>
@@ -633,6 +633,31 @@ public:
      }
   };
 DECLARE_SCRIPT(CountHamletWords,false)
+```
+
+After a recent update (2017-11-28), the Map iterator is no longer const and
+supports two addtional operations: remove and replace (setValue). So in the
+previous version, if you want to remove some elements from a map, you had to
+store the keys in a separate place, and remove these keys later. It is neither
+elegant nor efficient. The following example shows the difference:
+
+```MQL5
+HashMap<int,int> m;
+//--- before the update
+Vector<int> v;
+foreachm(int,key,int,value,m)
+{
+  if(value%2==0) v.push(key);
+}
+foreachv(int,key,v)
+{
+  m.remove(key);
+}
+//--- after the update
+foreachm(int,key,int,value,m)
+{
+  if(value%2==0) it.remove();
+}
 ```
 
 ### File System and IO 
@@ -895,6 +920,238 @@ void OnStart()
   }
 ```
 
+### Symetric Order Semantics
+
+What do I mean by *symetric order semantics*? Consider the following code to set
+a trailing stoploss step by step until the order is in breakeven state:
+
+```MQL5
+// Partial code for illustration purposes; not runnable if you don't have other codes
+// M_POINT is a constant (the Point value of current symbol)
+void TrailToBreakeven(const Order &order,OrderAttributes &attr)
+  {
+//--- Check if profitted more than InpBreakevenPoints
+   bool isSetStopLoss=false;
+   double stopLossLevel=0.0;
+
+   if(order.getStopLoss()>0)
+     {
+      if(order.getType()==OP_BUY)
+        {
+         if(order.getStopLoss()<order.getOpenPrice())
+           {
+            double profitPrice=m_symbol.getBid()-order.getOpenPrice()-InpBreakevenPoints*M_POINT;
+            if(profitPrice>0)
+              {
+               if(InpBreakevenStep>0)
+                 {
+                  int factor=int(profitPrice/(InpBreakevenStep*M_POINT));
+                  if(factor>0)
+                    {
+                     double sl=attr.getOriginalStoploss()+InpBreakevenPoints*M_POINT*factor;
+                     if(sl>order.getStopLoss())
+                       {
+                        isSetStopLoss=true;
+                        if(sl>order.getOpenPrice())
+                          {
+                           stopLossLevel=NormalizeDouble(order.getOpenPrice()+M_POINT,M_DIGITS);
+                          }
+                        else
+                          {
+                           stopLossLevel=NormalizeDouble(sl,M_DIGITS);
+                          }
+                       }
+                    }
+                 }
+               else
+                 {
+                  isSetStopLoss=true;
+                  stopLossLevel=NormalizeDouble(order.getOpenPrice()+M_POINT,M_DIGITS);
+                 }
+              }
+           }
+        }
+      else
+        {
+         if(order.getStopLoss()>order.getOpenPrice())
+           {
+            double profitPrice=order.getOpenPrice()-InpBreakevenPoints*M_POINT-m_symbol.getAsk();
+            if(profitPrice>0)
+              {
+               if(InpBreakevenStep>0)
+                 {
+                  int factor=int(profitPrice/(InpBreakevenStep*M_POINT));
+                  if(factor>0)
+                    {
+                     double sl=attr.getOriginalStoploss()-InpBreakevenPoints*M_POINT*factor;
+                     if(sl<order.getStopLoss())
+                       {
+                        isSetStopLoss=true;
+                        if(sl<order.getOpenPrice())
+                          {
+                           stopLossLevel=NormalizeDouble(order.getOpenPrice()-M_POINT,M_DIGITS);
+                          }
+                        else
+                          {
+                           stopLossLevel=NormalizeDouble(sl,M_DIGITS);
+                          }
+                       }
+                    }
+                 }
+               else
+                 {
+                  isSetStopLoss=true;
+                  stopLossLevel=NormalizeDouble(order.getOpenPrice()-M_POINT,M_DIGITS);
+                 }
+              }
+           }
+        }
+     }
+   if(isSetStopLoss)
+     {
+      if(OrderModify(order.getTicket(),0,stopLossLevel,0,0,clrNONE))
+        {
+         PrintFormat(">>> Setting order #%d stoploss to %f",order.getTicket(),stopLossLevel);
+         if((order.getType()==OP_BUY && stopLossLevel>=order.getOpenPrice())
+            || (order.getType()==OP_SELL && stopLossLevel<=order.getOpenPrice()))
+            attr.setState(Breakeven);
+        }
+      else
+        {
+         Alert(StringFormat(">>> Error setting order #%d stoploss %f",order.getTicket(),stopLossLevel));
+        }
+     }
+  }
+```
+
+This is very typical in everyday EA development. You can see for both BUY and
+SELL orders the logic is the same. But the code have to be written separately
+because they have enough differences. And it is also hard to tell what logic you
+are using because they are buried in the calculation detail. It is error prone
+to write like this, as you may forget to change some minus or plus signs when
+copy the almost same code. Furthur more, we frequently use price formatting,
+point value to absolute price difference conversions, and price normalization,
+etc. What if we can write the logic clearly only once and automatically deal
+with both BUY and SELL orders?
+
+The solution is *symetric order semantics*: it is a set of methods (with both
+instance and static versions) in the `Order` class. The method names are pretty
+simple (I made them short intentionally), and every method express a general
+semantic of an order regardless of its type. I will list the basic operations
+below and show how to use them later.
+
+1. Formatting and conversion
+
+There are 3 operations that support the formatting and conversion of a price
+value based on the order symbol.
+
+    * f(p) *format* price `p` to string with respect to the symbol digits
+    * n(p) *normalize* price `p` to a double with respect to the symbol digits
+    * ap(p) get the *absolute price difference* (double type) of point value `p` (int type)
+    
+2. Current price level
+
+It is very common to get the corresponding ask/bid value based on order type.
+For buy order, open with ask, close with bid; and vice versa for sell order. I
+provide 2 basic operations to get this value.
+
+    * s() get the correct price to *start* an order
+    * e() get the correct price to *end* an order
+    
+3. Price calculation
+
+There are 2 opertions for price calculation.
+
+    * p(s,e) get the *profit* as the absolute price difference from start price
+      `s` to the end price `e`. To get the loss, just use -p(s,e) or p(e,s); the
+      former is preferred as it is clearer expressing the opposite of *profit*
+    * pp(p,pr) the target *price* if we start from `p` and we want to *profit*
+      `pr`. Use pp(p,-pr) if we want to lose `pr`
+    
+There is a overloading method for `pp` where the `pr` parameter is in point
+value. It is just for convenience and not essential for the semantics.
+
+With these basic opperations, we can express most semantics about an order
+symetrically. For example, how do we express *breakeven*? It is
+`order.p(order.getOpenPrice(),order.getStoploss())>=0`. This evaluates to
+`order.getOpenPrice() <= order.getStopLoss()` for BUY order, and
+`order.getOpenPrice() >= order.getStoploss()` for SELL order. Literally, we can
+understand this by "if we move from open price to stop loss price, we still
+profit". This way, you only write a single set of rules and express it clearly.
+
+I will try to rewrite the example in the start of this section with *symetric
+order semantics*. Read carefully and compare it with the first example. See how
+the code length is greatly reduced and how the intention is made very clear.
+
+```MQL5
+// Partial code for illustration purposes; not runnable if you don't have other codes
+void TrailToBreakeven(const Order &o,OrderAttributes &attr)
+  {
+//--- Check if profitted more than InpBreakevenPoints
+   bool isSetStopLoss=false;
+   double stopLossLevel=0.0;
+
+   if(o.getStopLoss()>0)
+     {
+      //--- if not breakeven
+      if(o.p(o.getOpenPrice(),o.getStopLoss())<0)
+        {
+         //--- how much do we already profit?
+         double pp=o.p(o.getOpenPrice(),o.e());
+         //--- if we profit more than those points set in input parameter
+         if(pp>o.ap(InpBreakevenPoints))
+           {
+            //--- if we need to trail step by step
+            if(InpBreakevenStep>0)
+              {
+               int factor=int(pp/o.ap(InpBreakevenStep));
+               if(factor>0)
+                 {
+                  //--- calculate the target price by move stoploss in FAVOR to us
+                  //--- NOTE that pp can accept points directly in its second parameter
+                  double sl=o.pp(attr.getOriginalStoploss(),InpBreakevenPoints*factor);
+                  //--- if target stoploss is better than current one
+                  //--- (we will profit if we move from current stop loss to `sl`)
+                  if(o.p(o.getStopLoss(),sl)>0)
+                    {
+                     isSetStopLoss=true;
+                     //--- if the target make this order breakeven
+                     if(o.p(o.getOpenPrice(),sl)>=0)
+                        //--- we set stop loss to be one point better than open price
+                        stopLossLevel=o.pp(o.getOpenPrice(),1);
+                     else
+                        stopLossLevel=sl;
+                    }
+                 }
+              }
+            else
+              {
+               isSetStopLoss=true;
+               stopLossLevel=o.pp(o.getOpenPrice(),1);
+              }
+           }
+        }
+     }
+   if(isSetStopLoss)
+     {
+      //--- modify stop loss to *NORMALIZED* price
+      if(OrderModify(o.getTicket(),0,o.n(stopLossLevel),0,0,clrNONE))
+        {
+         //--- notice that we use %s for the price because we need to display the price
+         //--- to certain digits based on current order symbol
+         PrintFormat(">>> Setting order #%d stoploss to %s",o.getTicket(),o.f(stopLossLevel));
+         //--- we modify order state if this modification make the order breakeven
+         if(o.p(o.getOpenPrice(),stopLossLevel)>=0) attr.setState(Breakeven);
+        }
+      else
+        {
+         Alert(StringFormat(">>> Error setting order #%d stoploss %s",o.getTicket(),o.f(stopLossLevel)));
+        }
+     }
+  }
+```
+
+
 ## Contribution Guide
 
 I would be very glad if you want to contribute to this library, but there are
@@ -934,6 +1191,17 @@ from all levels of developers.
    much as I can.
 
 ## Changes
+* 2017-12-13: Deprecate and remove `RenkoIndicatorDriver`; use
+  `HistoryData::OnUpdate` event instead
+
+* 2017-11-28: Major refactoring of hash table based containers. The HashMap and
+  HashSet now shares the same code base for hashing and entry managements. The
+  compacting algorithm is improved. Map iterators support 2 addional operations
+  in a loop: remove and replace (setValue).
+
+* 2017-11-24: Improve and stablize OrderManager using *Symetric Order Semantics*
+
+* 2017-11-23: Designed and Implemented *Symetric Order Semantics*
 
 * 2017-09-28: Refined `OrderPool` code. Implemented order tracking module
   `Trade/OrderTracker`
